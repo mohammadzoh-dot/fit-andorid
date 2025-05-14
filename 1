@@ -1,0 +1,150 @@
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.Bundle
+import android.util.Log
+import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.FileWriter
+import kotlin.math.sqrt
+import kotlin.math.pow
+import kotlinx.coroutines.*
+import org.apache.commons.math3.transform.FastFourierTransformer
+import org.apache.commons.math3.transform.DftNormalization
+import org.apache.commons.math3.transform.TransformType
+import org.apache.commons.math3.analysis.function.Blackman
+import org.apache.commons.math3.ml.classification.RandomForestClassifier
+import org.apache.commons.math3.ml.data.DataSet
+import org.apache.commons.math3.ml.data.Instance
+
+data class SensorData(
+    val accelX: Float,
+    val accelY: Float,
+    val accelZ: Float,
+    val speedEstimate: Double,
+    val activityLabel: String
+)
+
+class SensorActivity : AppCompatActivity(), SensorEventListener {
+
+    private lateinit var sensorManager: SensorManager
+    private var accelerometer: Sensor? = null
+    private val sensorDataList = mutableListOf<SensorData>()
+    private val classifier = ActivityClassifier()
+    private val scope = CoroutineScope(Dispatchers.IO)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
+        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        classifier.trainModel()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        accelerometer?.let { sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_FASTEST) }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        event?.let {
+            val accelX = it.values[0]
+            val accelY = it.values[1]
+            val accelZ = it.values[2]
+            val filteredAccel = applyKalmanFilter(accelX, accelY, accelZ)
+            val fftFeatures = computeFFT(filteredAccel)
+            val features = extractFeatures(filteredAccel, fftFeatures)
+            val activityLabel = classifier.predictActivity(features)
+
+            val sensorData = SensorData(accelX, accelY, accelZ, features["speedEstimate"]!!, activityLabel)
+            sensorDataList.add(sensorData)
+
+            Log.d("SensorActivity", "Collected Data: $sensorData")
+            
+            scope.launch {
+                saveDataToFile(sensorData)
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+    private fun applyKalmanFilter(accelX: Float, accelY: Float, accelZ: Float): FloatArray {
+        val q = 0.0001f
+        val r = 0.005f
+        val xEst = floatArrayOf(accelX, accelY, accelZ)
+        val p = floatArrayOf(1f, 1f, 1f)
+        for (i in xEst.indices) {
+            p[i] += q
+            val k = p[i] / (p[i] + r)
+            xEst[i] += k * (floatArrayOf(accelX, accelY, accelZ)[i] - xEst[i])
+            p[i] *= (1 - k)
+        }
+        return xEst
+    }
+
+    private fun computeFFT(signal: FloatArray): DoubleArray {
+        val transformer = FastFourierTransformer(DftNormalization.STANDARD)
+        val blackman = Blackman()
+        val windowedSignal = signal.map { blackman.value(it.toDouble()) }.toDoubleArray()
+        val complexTransform = transformer.transform(windowedSignal, TransformType.FORWARD)
+        return complexTransform.map { sqrt(it.real.pow(2) + it.imaginary.pow(2)) }.toDoubleArray()
+    }
+
+    private fun extractFeatures(filteredAccel: FloatArray, fftFeatures: DoubleArray): Map<String, Double> {
+        val jerk = filteredAccel.zipWithNext { a, b -> abs(b - a) }.average()
+        return mapOf(
+            "speedEstimate" to sqrt(filteredAccel.map { it.toDouble().pow(2) }.sum()),
+            "energy" to filteredAccel.map { it.toDouble().pow(2) }.sum(),
+            "fftPeak" to fftFeatures.maxOrNull()?.toDouble() ?: 0.0,
+            "fftMean" to fftFeatures.average(),
+            "jerk" to jerk
+        )
+    }
+
+    private fun saveDataToFile(sensorData: SensorData) {
+        try {
+            val file = File(filesDir, "sensor_data.json")
+            val jsonArray = if (file.exists()) JSONArray(file.readText()) else JSONArray()
+            val jsonObject = JSONObject().apply {
+                put("accelX", sensorData.accelX)
+                put("accelY", sensorData.accelY)
+                put("accelZ", sensorData.accelZ)
+                put("speedEstimate", sensorData.speedEstimate)
+                put("activityLabel", sensorData.activityLabel)
+            }
+            jsonArray.put(jsonObject)
+            FileWriter(file).use { it.write(jsonArray.toString()) }
+            Log.d("SensorActivity", "Saved Data: ${jsonObject}")
+        } catch (e: Exception) {
+            Log.e("SensorActivity", "Error saving data: ${e.localizedMessage}")
+        }
+    }
+}
+
+class ActivityClassifier {
+    private val classifier = RandomForestClassifier(numTrees = 100)
+
+    fun trainModel() {
+        val trainingData = listOf(
+            floatArrayOf(0.5f, 0.3f, 0.7f), floatArrayOf(1.0f, 1.2f, 1.3f)
+        )
+        val labels = listOf("راه رفتن", "دویدن")
+        val dataSet = DataSet()
+        for (i in trainingData.indices) {
+            dataSet.addInstance(Instance(trainingData[i].map { it.toDouble() }.toDoubleArray(), labels[i]))
+        }
+        classifier.fit(dataSet)
+    }
+
+    fun predictActivity(features: Map<String, Double>): String {
+        return classifier.predict(features.map { it.value }.toDoubleArray())
+    }
+}
